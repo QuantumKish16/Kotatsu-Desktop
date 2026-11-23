@@ -57,3 +57,9 @@ The compiled installer will be generated in `desktopApp/build/compose/binaries/m
 ## Credits & License
 - Powered by **[kotatsu-parsers-redo](https://github.com)** and inspired by **[KotatsuApp/Kotatsu](https://github.com)**.
 - Licensed under the **GNU General Public License v3.0 (GPL-3.0)** — see the [LICENSE](LICENSE) file for details.
+
+## Disclaimer
+
+**Kotatsu Desktop** is an unofficial, independent open-source project and is not affiliated with, endorsed by, or connected to the original **KotatsuApp** team or any manga/comic publishers.
+
+This application does not host, own, store, or distribute any manga, manhwa, comics, or copyrighted content. It acts solely as a desktop client and browser interface that fetches publicly available data via third-party parser libraries (`kotatsu-parsers-redo`). Users are responsible for complying with the terms of service of any external sources they access and the copyright laws of their respective jurisdictions.
