@@ -1,3 +1,4 @@
+<img src="assets/logo.png" width="128" />
 # Kotatsu Desktop (Unofficial)
 
 An unofficial, open-source desktop manga reader built with **Kotlin Multiplatform** and **Compose Multiplatform**, powered by the official [kotatsu-parsers-redo](https://github.com) engine.
