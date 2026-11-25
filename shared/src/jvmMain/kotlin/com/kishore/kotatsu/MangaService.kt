@@ -8,19 +8,20 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
+import okhttp3.Cookie
+import okhttp3.CookieJar
+import okhttp3.HttpUrl
+import okhttp3.Dns
+import okhttp3.dnsoverhttps.DnsOverHttps
 import org.koitharu.kotatsu.parsers.DirectParsersAccess
 import org.koitharu.kotatsu.parsers.MangaParser
-import org.koitharu.kotatsu.parsers.model.ContentRating
-import org.koitharu.kotatsu.parsers.model.ContentType
-import org.koitharu.kotatsu.parsers.model.Manga
-import org.koitharu.kotatsu.parsers.model.MangaChapter
-import org.koitharu.kotatsu.parsers.model.MangaListFilter
-import org.koitharu.kotatsu.parsers.model.MangaListFilterOptions
-import org.koitharu.kotatsu.parsers.model.MangaPage
-import org.koitharu.kotatsu.parsers.model.MangaParserSource
-import org.koitharu.kotatsu.parsers.model.MangaTag
-import org.koitharu.kotatsu.parsers.model.SortOrder
+import org.koitharu.kotatsu.parsers.model.*
+import java.net.InetAddress
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
+
 
 // Holds search results for a single source that had matches
 data class SourceSearchResult @OptIn(DirectParsersAccess::class) constructor(
@@ -33,8 +34,80 @@ class MangaService {
     @OptIn(DirectParsersAccess::class)
     private val parserCache = mutableMapOf<MangaParserSource, MangaParser>()
 
-    val httpClient: OkHttpClient
-        get() = context.httpClient
+
+
+    private val bootstrapClient = OkHttpClient.Builder().build()
+
+    private val cloudflareDns = DnsOverHttps.Builder()
+        .client(bootstrapClient)
+        .url("https://1.1.1".toHttpUrl()) // Must be 1.1.1.1 to match bootstrap IP!
+        .bootstrapDnsHosts(
+            InetAddress.getByName("1.1.1.1"),
+            InetAddress.getByName("1.0.0.1")
+        )
+        .includeIPv6(false)
+        .build()
+
+    // Smart hybrid DNS: uses Cloudflare DoH for MangaDex, and fast system DNS for everything else
+    private val smartDns = object : Dns {
+        override fun lookup(hostname: String): List<InetAddress> {
+            return if (hostname.contains("mangadex.org", ignoreCase = true)) {
+                runCatching { cloudflareDns.lookup(hostname) }
+                    .getOrElse { Dns.SYSTEM.lookup(hostname) }
+            } else {
+                Dns.SYSTEM.lookup(hostname)
+            }
+        }
+    }
+
+
+    private val cookieJar = object : CookieJar {
+        private val store = mutableMapOf<String, MutableList<Cookie>>()
+
+        override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
+            val hostCookies = store.getOrPut(url.host) { mutableListOf() }
+            cookies.forEach { newCookie ->
+                hostCookies.removeAll { it.name == newCookie.name }
+                hostCookies.add(newCookie)
+            }
+        }
+
+        override fun loadForRequest(url: HttpUrl): List<Cookie> {
+            val now = System.currentTimeMillis()
+            val hostCookies = store[url.host] ?: return emptyList()
+            hostCookies.removeAll { it.expiresAt < now }
+            return hostCookies.toList()
+        }
+    }
+
+    val httpClient: OkHttpClient = OkHttpClient.Builder()
+        .dns(smartDns)
+        .cookieJar(cookieJar)
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(20, TimeUnit.SECONDS)
+        .addInterceptor { chain ->
+            val original = chain.request()
+            val host = original.url.host
+            val builder = original.newBuilder()
+
+            // Always send a standard Chrome User-Agent so CDNs like planeptune.us don't return HTTP 403
+            if (original.header("User-Agent") == null || original.header("User-Agent")!!.startsWith("okhttp")) {
+                builder.header(
+                    "User-Agent",
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+                )
+            }
+
+            // MangaDex CDN & API require https://mangadex.org as Referer
+            if (host.contains("mangadex.org")) {
+                builder.header("Referer", "https://mangadex.org")
+            }
+            // Note: Do NOT override Referer for other CDNs because MangaPageImage already sets the exact parser base URL!
+
+            chain.proceed(builder.build())
+        }
+        .build()
+
 
     @OptIn(DirectParsersAccess::class)
     fun getSourceBaseUrl(source: MangaParserSource): String {
@@ -177,13 +250,56 @@ class MangaService {
         getParser(source).getPages(chapter)
     }
 
-    // Step 2: Resolve the direct image URL for a single MangaPage
+
+    // Caches resolved direct image URLs so preloaded pages don't re-fetch HTML
+    private val resolvedPageUrlCache = ConcurrentHashMap<MangaPage, String>()
+
     @OptIn(DirectParsersAccess::class)
     suspend fun resolvePageImageUrl(
         source: MangaParserSource,
         page: MangaPage
     ): String = withContext(Dispatchers.IO) {
-        getParser(source).getPageUrl(page)
+        // 1. Return immediately if we already resolved this page's URL
+        resolvedPageUrlCache[page]?.let { return@withContext it }
+
+        // 2. Otherwise fetch from the parser, save it in the cache, and return it
+        val resolved = getParser(source).getPageUrl(page)
+        resolvedPageUrlCache[page] = resolved
+        resolved
     }
+
+    data class MangaUpdateResult @OptIn(DirectParsersAccess::class) constructor(
+        val savedManga: SavedManga,
+        val freshDetails: Manga,
+        val source: MangaParserSource
+    )
+
+    @OptIn(DirectParsersAccess::class)
+    fun checkFavoritesForUpdates(
+        favorites: List<SavedManga>
+    ): Flow<MangaUpdateResult> = channelFlow {
+        val semaphore = Semaphore(permits = 5)
+
+        for (saved in favorites) {
+            val source = runCatching { MangaParserSource.valueOf(saved.sourceName) }.getOrNull() ?: continue
+            val stubManga = saved.toKotatsuManga() ?: continue
+
+            launch(Dispatchers.IO) {
+                semaphore.withPermit {
+                    try {
+                        val fresh = withTimeoutOrNull(10_000L) {
+                            getMangaDetails(source, stubManga)
+                        }
+                        if (fresh != null) {
+                            send(MangaUpdateResult(saved, fresh, source))
+                        }
+                    } catch (_: Exception) {
+                        // Skip temporarily unreachable sources during batch check
+                    }
+                }
+            }
+        }
+    }
+
 
 }

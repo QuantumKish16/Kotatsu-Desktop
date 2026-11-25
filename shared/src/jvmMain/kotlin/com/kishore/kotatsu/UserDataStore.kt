@@ -9,6 +9,18 @@ import org.koitharu.kotatsu.parsers.model.MangaChapter
 import org.koitharu.kotatsu.parsers.model.MangaParserSource
 import org.koitharu.kotatsu.parsers.model.MangaState
 import java.io.File
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.longOrNull
+import java.util.zip.ZipInputStream
+
 
 @Serializable
 data class SavedManga(
@@ -81,14 +93,74 @@ data class ReadingHistoryEntry(
 )
 
 @Serializable
+data class CachedChapter(
+    val id: Long,
+    val title: String? = null,
+    val number: Float = 0f,
+    val volume: Int = 0,
+    val url: String,
+    val scanlator: String? = null,
+    val uploadDate: Long = 0L,
+    val branch: String? = null,
+    val sourceName: String
+) {
+    @OptIn(DirectParsersAccess::class)
+    fun toKotatsuChapter(): MangaChapter? {
+        val src = runCatching { MangaParserSource.valueOf(sourceName) }.getOrNull() ?: return null
+        return MangaChapter(
+            id = id,
+            title = title,
+            number = number,
+            volume = volume,
+            url = url,
+            scanlator = scanlator,
+            uploadDate = uploadDate,
+            branch = branch,
+            source = src
+        )
+    }
+
+    companion object {
+        @OptIn(DirectParsersAccess::class)
+        fun fromKotatsuChapter(chapter: MangaChapter, source: MangaParserSource): CachedChapter {
+            return CachedChapter(
+                id = chapter.id,
+                title = chapter.title,
+                number = chapter.number,
+                volume = chapter.volume,
+                url = chapter.url,
+                scanlator = chapter.scanlator,
+                uploadDate = chapter.uploadDate,
+                branch = chapter.branch,
+                sourceName = source.name
+            )
+        }
+    }
+}
+
+@Serializable
+data class CachedMangaDetails(
+    val mangaId: Long,
+    val description: String? = null,
+    val chapters: List<CachedChapter> = emptyList(),
+    val newChaptersCount: Int = 0,
+    val lastCheckedAt: Long = System.currentTimeMillis()
+)
+
+
+@Serializable
 data class AppSettings(
     val defaultLanguage: String = "en",
     val hideNsfw: Boolean = true,
-    val defaultReaderModeName: String = "SINGLE",
+    val defaultReaderModeName: String = "WEBTOON",
     val defaultRtl: Boolean = true,
     val maxSearchSources: Int = 60,
-    val darkTheme: Boolean = false
+    val darkTheme: Boolean = false,
+    val preloadPagesCount: Int = 3,
+    val incognitoMode: Boolean = false,
+    val compactGrid: Boolean = false
 )
+
 
 @Serializable
 data class KotatsuBackupData(
@@ -96,7 +168,8 @@ data class KotatsuBackupData(
     val exportedAt: Long = System.currentTimeMillis(),
     val settings: AppSettings = AppSettings(),
     val favorites: List<SavedManga> = emptyList(),
-    val history: List<ReadingHistoryEntry> = emptyList()
+    val history: List<ReadingHistoryEntry> = emptyList(),
+    val cachedDetails: Map<Long, CachedMangaDetails> = emptyMap()
 )
 
 
@@ -225,4 +298,199 @@ class UserDataStore {
         return mergedFavoritesMap.size to mergedHistoryMap.size
 
     }
+
+    fun getCachedDetails(mangaId: Long): CachedMangaDetails? = currentData.cachedDetails[mangaId]
+
+    fun clearNewChaptersBadge(mangaId: Long) {
+        val existing = currentData.cachedDetails[mangaId] ?: return
+        if (existing.newChaptersCount > 0) {
+            val updated = currentData.cachedDetails + (mangaId to existing.copy(newChaptersCount = 0))
+            currentData = currentData.copy(cachedDetails = updated)
+            saveToDisk()
+        }
+    }
+
+    /**
+     * Saves fresh chapters for a manga and returns how many brand-new chapters were detected
+     * compared to the previously cached list.
+     */
+    @OptIn(DirectParsersAccess::class)
+    fun updateCachedDetails(
+        manga: Manga,
+        source: MangaParserSource,
+        freshChapters: List<MangaChapter>,
+        isBackgroundUpdateCheck: Boolean = false
+    ): Int {
+        val existing = currentData.cachedDetails[manga.id]
+        val cachedList = freshChapters.map { CachedChapter.fromKotatsuChapter(it, source) }
+
+        val newlyFoundCount = if (existing != null && existing.chapters.isNotEmpty()) {
+            val oldIds = existing.chapters.map { it.id }.toSet()
+            freshChapters.count { it.id !in oldIds }
+        } else {
+            0
+        }
+
+        val badgeCount = if (isBackgroundUpdateCheck) {
+            (existing?.newChaptersCount ?: 0) + newlyFoundCount
+        } else {
+            0 // User is actively viewing this manga right now, so clear the unread badge
+        }
+
+        val newRecord = CachedMangaDetails(
+            mangaId = manga.id,
+            description = manga.description ?: existing?.description,
+            chapters = cachedList,
+            newChaptersCount = badgeCount,
+            lastCheckedAt = System.currentTimeMillis()
+        )
+
+        currentData = currentData.copy(
+            cachedDetails = currentData.cachedDetails + (manga.id to newRecord)
+        )
+        saveToDisk()
+        return newlyFoundCount
+    }
+
+    fun removeFavorite(mangaId: Long) {
+        currentData = currentData.copy(
+            favorites = currentData.favorites.filterNot { it.id == mangaId }
+        )
+        saveToDisk()
+    }
+
+    fun removeFromHistory(mangaId: Long) {
+        currentData = currentData.copy(
+            history = currentData.history.filterNot { it.manga.id == mangaId }
+        )
+        saveToDisk()
+    }
+
+    fun resetReadChapters(mangaId: Long) {
+        val existing = getHistoryForManga(mangaId) ?: return
+        val updatedEntry = existing.copy(
+            lastPageIndex = 0,
+            readChapterIds = emptySet(),
+            updatedAt = System.currentTimeMillis()
+        )
+        val others = currentData.history.filterNot { it.manga.id == mangaId }
+        currentData = currentData.copy(history = listOf(updatedEntry) + others)
+        saveToDisk()
+    }
+
+    private fun parseAndroidMangaObject(obj: JsonObject): SavedManga? {
+        val id = obj["id"]?.jsonPrimitive?.longOrNull ?: return null
+        val title = obj["title"]?.jsonPrimitive?.contentOrNull ?: return null
+        val url = obj["url"]?.jsonPrimitive?.contentOrNull ?: return null
+        val publicUrl = obj["public_url"]?.jsonPrimitive?.contentOrNull
+            ?: obj["publicUrl"]?.jsonPrimitive?.contentOrNull
+            ?: url
+        val coverUrl = obj["cover_url"]?.jsonPrimitive?.contentOrNull
+            ?: obj["coverUrl"]?.jsonPrimitive?.contentOrNull
+        val sourceName = obj["source"]?.jsonPrimitive?.contentOrNull ?: return null
+        val author = obj["author"]?.jsonPrimitive?.contentOrNull
+        val isNsfw = obj["nsfw"]?.jsonPrimitive?.booleanOrNull
+            ?: (obj["content_rating"]?.jsonPrimitive?.contentOrNull == "ADULT")
+
+        return SavedManga(
+            id = id,
+            title = title,
+            url = url,
+            publicUrl = publicUrl,
+            coverUrl = coverUrl,
+            sourceName = sourceName,
+            authors = listOfNotNull(author).filter { it.isNotBlank() }.toSet(),
+            isNsfw = isNsfw
+        )
+    }
+
+    /**
+     * Imports favorites and reading history from an official Android Kotatsu `.bk.zip` backup file,
+     * merging them safely with existing desktop data.
+     */
+    fun importKotatsuAndroidZip(zipFile: File): Pair<Int, Int> {
+        var favouritesJsonText: String? = null
+        var historyJsonText: String? = null
+
+        ZipInputStream(zipFile.inputStream().buffered()).use { zis ->
+            var entry = zis.nextEntry
+            while (entry != null) {
+                if (!entry.isDirectory) {
+                    val entryName = entry.name.substringAfterLast('/').substringBefore('.')
+                    when (entryName.lowercase()) {
+                        "favourites", "favorites" -> {
+                            favouritesJsonText = zis.readBytes().toString(Charsets.UTF_8)
+                        }
+                        "history" -> {
+                            historyJsonText = zis.readBytes().toString(Charsets.UTF_8)
+                        }
+                    }
+                }
+                zis.closeEntry()
+                entry = zis.nextEntry
+            }
+        }
+
+        val importedFavorites = mutableListOf<SavedManga>()
+        favouritesJsonText?.let { raw ->
+            val root: JsonElement = json.parseToJsonElement(raw)
+            if (root is JsonArray) {
+                for (item in root) {
+                    val itemObj = item.jsonObject
+                    val mangaObj = itemObj["manga"]?.jsonObject ?: itemObj
+                    parseAndroidMangaObject(mangaObj)?.let { importedFavorites.add(it) }
+                }
+            }
+        }
+
+        val importedHistory = mutableListOf<ReadingHistoryEntry>()
+        historyJsonText?.let { raw ->
+            val root: JsonElement = json.parseToJsonElement(raw)
+            if (root is JsonArray) {
+                for (item in root) {
+                    val itemObj = item.jsonObject
+                    val mangaObj = itemObj["manga"]?.jsonObject ?: continue
+                    val savedManga = parseAndroidMangaObject(mangaObj) ?: continue
+                    val chapterId = itemObj["chapter_id"]?.jsonPrimitive?.longOrNull
+                        ?: itemObj["chapterId"]?.jsonPrimitive?.longOrNull
+                        ?: 0L
+                    val pageIndex = itemObj["page"]?.jsonPrimitive?.intOrNull ?: 0
+                    val updatedAt = itemObj["updated_at"]?.jsonPrimitive?.longOrNull
+                        ?: itemObj["updatedAt"]?.jsonPrimitive?.longOrNull
+                        ?: System.currentTimeMillis()
+
+                    importedHistory.add(
+                        ReadingHistoryEntry(
+                            manga = savedManga,
+                            lastChapterId = chapterId,
+                            lastChapterTitle = if (chapterId != 0L) "Chapter (Imported)" else "Started",
+                            lastChapterNumber = 0f,
+                            lastPageIndex = pageIndex,
+                            readChapterIds = if (chapterId != 0L) setOf(chapterId) else emptySet(),
+                            updatedAt = updatedAt
+                        )
+                    )
+                }
+            }
+        }
+
+        // Merge with existing desktop Favorites & History without duplicates
+        val existingFavIds = currentData.favorites.map { it.id }.toSet()
+        val mergedFavorites = currentData.favorites + importedFavorites.filter { it.id !in existingFavIds }
+
+        val existingHistIds = currentData.history.map { it.manga.id }.toSet()
+        val mergedHistory = (currentData.history + importedHistory.filter { it.manga.id !in existingHistIds })
+            .sortedByDescending { it.updatedAt }
+
+        currentData = currentData.copy(
+            favorites = mergedFavorites,
+            history = mergedHistory
+        )
+        saveToDisk()
+
+        return importedFavorites.size to importedHistory.size
+    }
+
+
+
 }
